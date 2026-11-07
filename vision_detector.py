@@ -24,6 +24,7 @@ from typing import List, Tuple, Optional, Dict, Any
 # Suprimir logs verbosos de TensorFlow / MediaPipe C++ en stderr
 os.environ["GLOG_minloglevel"] = "2"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import cv2
 import numpy as np
@@ -94,25 +95,27 @@ class DetectedHand:
         self.pixel_landmarks[:, 0] = np.clip(landmarks[:, 0] * frame_w, 0, frame_w - 1).astype(np.int32)
         self.pixel_landmarks[:, 1] = np.clip(landmarks[:, 1] * frame_h, 0, frame_h - 1).astype(np.int32)
 
-        # Escala de la palma: Distancia muñeca (0) a MCP dedo medio (9)
-        self.palm_scale = max(float(np.linalg.norm(landmarks[WRIST] - landmarks[MIDDLE_MCP])), 0.001)
+        # Escala de la palma (2D para inmunidad al ruido de profundidad Z)
+        self.palm_scale = max(float(np.linalg.norm(landmarks[WRIST, :2] - landmarks[MIDDLE_MCP, :2])), 0.001)
 
-        # Vector normal a la palma 3D
+        # Vector normal a la palma 3D (orientado hacia afuera de la palma en vista espejo)
         v1 = landmarks[INDEX_MCP] - landmarks[WRIST]
         v2 = landmarks[PINKY_MCP] - landmarks[WRIST]
-        normal = np.cross(v1, v2)
+        normal = np.cross(v2, v1) if label == "Right" else np.cross(v1, v2)
         norm_mag = np.linalg.norm(normal)
         self.palm_normal = normal / (norm_mag + 1e-7)
 
 
 # =============================================================================
-# ENCAPSULADOR DE MEDIAPIPE (Tasks API y Legacy API)
+# ENCAPSULADOR DE MEDIAPIPE (Tasks API y Legacy API) CON SUAVIZADO TEMPORAL
 # =============================================================================
 class HandTracker:
     """
     Rastreador de manos compatible de forma transparente con:
     1) MediaPipe Tasks HandLandmarker (MediaPipe >= 0.10.14+)
     2) MediaPipe Solutions Hands (MediaPipe legacy)
+    Incluye filtrado exponencial adaptativo (EMA) para reducir el temblor de landmarks
+    y asignación espacial/anatómica estable de mano izquierda y derecha.
     """
     def __init__(self, max_hands: int = 2, min_detection_conf: float = 0.5, min_track_conf: float = 0.5):
         self.max_hands = max_hands
@@ -120,6 +123,8 @@ class HandTracker:
         self.min_track_conf = min_track_conf
         self.use_tasks = False
         self.detector = None
+        self._prev_smoothed: Dict[str, np.ndarray] = {}
+        self._prev_wrist_pos: Dict[str, np.ndarray] = {}
 
         if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
             # Usar API clásica si está disponible
@@ -164,36 +169,91 @@ class HandTracker:
         )
         self.detector = vision.HandLandmarker.create_from_options(options)
 
+    def _smooth_landmarks(self, label: str, lms: np.ndarray) -> np.ndarray:
+        """Aplica suavizado exponencial adaptativo (EMA) para eliminar jitter sin añadir latencia."""
+        wrist_xy = lms[WRIST, :2]
+        if label in self._prev_smoothed and label in self._prev_wrist_pos:
+            dist = float(np.linalg.norm(wrist_xy - self._prev_wrist_pos[label]))
+            if dist < 0.18:
+                # Si se mueve rápido (ej. swipe o zig-zag), responder rápido (alpha alto);
+                # si está quieta haciendo una postura, suavizar más (alpha moderado).
+                alpha = 0.82 if dist > 0.025 else 0.50
+                smoothed = alpha * lms + (1.0 - alpha) * self._prev_smoothed[label]
+                self._prev_smoothed[label] = smoothed
+                self._prev_wrist_pos[label] = wrist_xy
+                return smoothed
+
+        self._prev_smoothed[label] = lms.copy()
+        self._prev_wrist_pos[label] = wrist_xy.copy()
+        return lms
+
     def process(self, rgb_frame: np.ndarray, is_mirrored: bool = True) -> List[DetectedHand]:
-        """Procesa un fotograma RGB y retorna lista de DetectedHand."""
+        """Procesa un fotograma RGB y retorna lista de DetectedHand con roles estabilizados."""
         h, w, _ = rgb_frame.shape
-        detected_hands: List[DetectedHand] = []
+        raw_detections: List[Tuple[str, float, np.ndarray]] = []
 
         if not self.use_tasks:
             results = self.mp_hands.process(rgb_frame)
             if results and results.multi_hand_landmarks:
                 for idx, hand_lms in enumerate(results.multi_hand_landmarks):
-                    # En modo espejo, invertimos la etiqueta asignada si es necesario
                     label = "Right"
+                    score = 0.8
                     if results.multi_handedness and idx < len(results.multi_handedness):
-                        raw_label = results.multi_handedness[idx].classification[0].label
-                        # Si está espejado, 'Left' en feed espejado corresponde a mano izquierda física
+                        cls_info = results.multi_handedness[idx].classification[0]
+                        raw_label = cls_info.label
+                        score = float(cls_info.score)
                         label = ("Left" if raw_label == "Right" else "Right") if is_mirrored else raw_label
 
                     lms_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_lms.landmark], dtype=np.float32)
-                    detected_hands.append(DetectedHand(label, lms_array, w, h))
+                    raw_detections.append((label, score, lms_array))
         else:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
             results = self.detector.detect(mp_image)
             if results and results.hand_landmarks:
                 for idx, hand_lms in enumerate(results.hand_landmarks):
                     label = "Right"
+                    score = 0.8
                     if results.handedness and idx < len(results.handedness):
-                        raw_label = results.handedness[idx][0].category_name
+                        cat = results.handedness[idx][0]
+                        raw_label = cat.category_name
+                        score = float(cat.score)
                         label = ("Left" if raw_label == "Right" else "Right") if is_mirrored else raw_label
 
                     lms_array = np.array([[lm.x, lm.y, lm.z] for lm in hand_lms], dtype=np.float32)
-                    detected_hands.append(DetectedHand(label, lms_array, w, h))
+                    raw_detections.append((label, score, lms_array))
+
+        if not raw_detections:
+            self._prev_smoothed.clear()
+            self._prev_wrist_pos.clear()
+            return []
+
+        detected_hands: List[DetectedHand] = []
+
+        # Si hay 2 manos presentes, asignarlas por posición horizontal relativa (izquierda vs derecha)
+        # para evitar que al rotar la muñeca MediaPipe invierta o duplique la etiqueta de ambas manos.
+        if len(raw_detections) >= 2:
+            sorted_dets = sorted(raw_detections[:2], key=lambda item: float(item[2][WRIST, 0]))
+            left_role = "Left" if is_mirrored else "Right"
+            right_role = "Right" if is_mirrored else "Left"
+            lms_left = self._smooth_landmarks(left_role, sorted_dets[0][2])
+            lms_right = self._smooth_landmarks(right_role, sorted_dets[1][2])
+            detected_hands.append(DetectedHand(left_role, lms_left, w, h))
+            detected_hands.append(DetectedHand(right_role, lms_right, w, h))
+        else:
+            label, score, lms = raw_detections[0]
+            wrist_xy = lms[WRIST, :2]
+            # Continuidad temporal: si la mano estaba rastreada muy cerca en el frame previo
+            # y MediaPipe duda al rotar la muñeca, mantener la identidad previa.
+            for prev_label, prev_pos in self._prev_wrist_pos.items():
+                if float(np.linalg.norm(wrist_xy - prev_pos)) < 0.12 and score < 0.88:
+                    label = prev_label
+                    break
+            # Dejar solo la mano activa en el historial para no confundir futuros frames
+            other_label = "Left" if label == "Right" else "Right"
+            self._prev_smoothed.pop(other_label, None)
+            self._prev_wrist_pos.pop(other_label, None)
+            lms_smooth = self._smooth_landmarks(label, lms)
+            detected_hands.append(DetectedHand(label, lms_smooth, w, h))
 
         return detected_hands
 
@@ -347,7 +407,7 @@ class GestureClassifier:
 
     @staticmethod
     def _is_finger_extended(lms: np.ndarray, tip_idx: int, pip_idx: int, mcp_idx: int, palm_scale: float) -> bool:
-        """Determina si un dedo (índice, medio, anular o meñique) está extendido."""
+        """Determina si un dedo (índice, medio, anular o meñique) está extendido con tolerancias naturales."""
         d_tip_wrist = np.linalg.norm(lms[tip_idx] - lms[WRIST])
         d_pip_wrist = np.linalg.norm(lms[pip_idx] - lms[WRIST])
         d_tip_mcp = np.linalg.norm(lms[tip_idx] - lms[mcp_idx])
@@ -357,14 +417,17 @@ class GestureClassifier:
         v2 = lms[tip_idx] - lms[pip_idx]
         cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-7)
 
-        return bool(d_tip_wrist > d_pip_wrist * 1.12 and d_tip_mcp > 0.75 * palm_scale and cos_angle > 0.60)
+        # Criterio más flexible y robusto ante ligeras flexiones o perspectiva oblicua
+        return bool(d_tip_wrist > d_pip_wrist * 1.05 and d_tip_mcp > 0.60 * palm_scale and cos_angle > 0.40)
 
     @staticmethod
     def _is_thumb_extended(lms: np.ndarray, palm_scale: float) -> bool:
         """Determina si el pulgar está extendido y separado de la palma."""
         d_tip_pinky_mcp = np.linalg.norm(lms[THUMB_TIP] - lms[PINKY_MCP])
         d_tip_index_mcp = np.linalg.norm(lms[THUMB_TIP] - lms[INDEX_MCP])
-        return bool(d_tip_pinky_mcp > 0.95 * palm_scale and d_tip_index_mcp > 0.45 * palm_scale)
+        d_tip_wrist = np.linalg.norm(lms[THUMB_TIP] - lms[WRIST])
+        d_cmc_wrist = np.linalg.norm(lms[THUMB_CMC] - lms[WRIST])
+        return bool(d_tip_pinky_mcp > 0.85 * palm_scale and d_tip_index_mcp > 0.38 * palm_scale and d_tip_wrist > d_cmc_wrist * 1.10)
 
     def count_extended_fingers(self, hand: DetectedHand) -> Tuple[int, List[bool]]:
         """Cuenta el número de dedos extendidos en una mano dada."""
@@ -388,7 +451,7 @@ class GestureClassifier:
         Clasifica la postura estática actual o gesto cinemático de acción.
         Retorna (token_gesture, digit_value_if_numeric).
         """
-        # Si ambas manos bajaron por debajo de 0.85 o no hay manos activas tras actividad
+        # Si ambas manos bajaron por debajo de 0.82 o no hay manos activas tras actividad
         all_hands_low = True
         present_hands = [h for h in (right_hand, left_hand) if h is not None]
 
@@ -402,7 +465,7 @@ class GestureClassifier:
 
         if all_hands_low and self.had_hands_active:
             self.hands_absent_counter += 1
-            if self.hands_absent_counter >= 6:
+            if self.hands_absent_counter >= 5:
                 self.had_hands_active = False
                 self.hands_absent_counter = 0
                 return "[DELIM_END]", None
@@ -420,10 +483,10 @@ class GestureClassifier:
             dist_cross1 = np.linalg.norm(r_lms[INDEX_TIP] - l_lms[THUMB_TIP])
             dist_cross2 = np.linalg.norm(l_lms[INDEX_TIP] - r_lms[THUMB_TIP])
             avg_ps = (right_hand.palm_scale + left_hand.palm_scale) / 2.0
-            if dist_cross1 < 0.8 * avg_ps and dist_cross2 < 0.8 * avg_ps:
+            if dist_cross1 < 0.9 * avg_ps and dist_cross2 < 0.9 * avg_ps:
                 return "[FRAME_SHAPE]", None
 
-            # Conteo bimanual para multidígitos de 6 a 10
+            # Conteo bimanual para números de 6 a 10
             r_count, r_states = self.count_extended_fingers(right_hand)
             l_count, l_states = self.count_extended_fingers(left_hand)
             total_fingers = r_count + l_count
@@ -444,12 +507,12 @@ class GestureClassifier:
         curr_x = lms[INDEX_MCP, 0]
         curr_y = lms[INDEX_MCP, 1]
         self.swipe_history.append((curr_x, curr_y, time.time()))
-        if len(self.swipe_history) >= 5:
+        if len(self.swipe_history) >= 4:
             dx = self.swipe_history[-1][0] - self.swipe_history[0][0]
             dy = self.swipe_history[-1][1] - self.swipe_history[0][1]
             dt = max(self.swipe_history[-1][2] - self.swipe_history[0][2], 0.001)
             vx = abs(dx) / dt
-            if abs(dx) > 0.18 and abs(dx) > 1.8 * abs(dy) and vx > 0.7:
+            if abs(dx) > 0.16 and abs(dx) > 1.6 * abs(dy) and vx > 0.6:
                 self.swipe_history.clear()
                 return "[SIDE_SWIPE]", None
 
@@ -459,23 +522,24 @@ class GestureClassifier:
                 np.linalg.norm(lms[idx] - lms[WRIST])
                 for idx in (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP)
             ]
-            if max(tips_to_wrist) < 1.15 * ps:
+            if max(tips_to_wrist) < 1.25 * ps:
                 return "[BLOCK_END]", None
 
-        # 3. Círculo: Forma de 'O' con índice y pulgar [DOT_CIRCLE]
-        # Índice y pulgar se tocan, pero medio/anular/meñique extendidos (estilo OK sign)
+        # Distancias clave para interacción pulgar-índice
         d_thumb_idx = np.linalg.norm(lms[THUMB_TIP] - lms[INDEX_TIP])
         d_thumb_mid = np.linalg.norm(lms[THUMB_TIP] - lms[MIDDLE_TIP])
         d_idx_wrist = np.linalg.norm(lms[INDEX_TIP] - lms[WRIST])
 
-        if d_thumb_idx < 0.36 * ps and (mid_ext or pinky_ext):
+        # 3. Círculo: Forma de 'O' con índice y pulgar [DOT_CIRCLE] (OK sign)
+        # Índice y pulgar se tocan, y al menos 2 dedos restantes bien extendidos
+        other_extended_count = sum([mid_ext, ring_ext, pinky_ext])
+        if d_thumb_idx < 0.40 * ps and other_extended_count >= 2:
             return "[DOT_CIRCLE]", None
 
         # 4. Asignación: Pellizco (pinch) [OP_ASSIGN]
-        # Yemas de dedos unidas formando pellizco hacia adelante
-        if d_thumb_idx < 0.35 * ps and d_idx_wrist > 0.95 * ps:
-            if d_thumb_mid < 0.45 * ps or (not mid_ext and not pinky_ext):
-                return "[OP_ASSIGN]", None
+        # Yemas de pulgar e índice juntas hacia el frente, con dedos restantes plegados
+        if d_thumb_idx < 0.38 * ps and other_extended_count <= 1:
+            return "[OP_ASSIGN]", None
 
         # 5. Agrupar / Polígono: Marco 'L' unimanual [FRAME_SHAPE]
         if idx_ext and thumb_ext and not mid_ext and not ring_ext and not pinky_ext:
@@ -483,7 +547,7 @@ class GestureClassifier:
             v_idx = lms[INDEX_TIP] - lms[INDEX_MCP]
             cos_th_idx = np.dot(v_thumb, v_idx) / (np.linalg.norm(v_thumb) * np.linalg.norm(v_idx) + 1e-7)
             angle_deg = np.degrees(np.arccos(np.clip(cos_th_idx, -1.0, 1.0)))
-            if 65.0 <= angle_deg <= 118.0:
+            if 55.0 <= angle_deg <= 125.0:
                 return "[FRAME_SHAPE]", None
 
         # 6. Vértice / Punto: Dedo índice extendido, demás flexionados [INDEX_EXTENDED]
@@ -491,54 +555,62 @@ class GestureClassifier:
             return "[INDEX_EXTENDED]", None
 
         # 7. Inicio de Bloque: Palma plana extendida hacia el frente [BLOCK_START]
-        # Todos los dedos extendidos y palma orientada perpendicular al frente
+        # 5 dedos extendidos apuntando hacia arriba/frente
         if ext_count == 5:
-            # Verificar que la palma mire hacia el frente (cámara)
-            normal_z = abs(right_hand.palm_normal[2])
-            normal_y = right_hand.palm_normal[1]
-            if normal_z > 0.40 and abs(normal_y) < 0.45:
+            # Si las puntas de los dedos están claramente por encima de los MCPs (mano abierta vertical)
+            fingers_upward = (
+                lms[INDEX_TIP, 1] < lms[INDEX_MCP, 1] and
+                lms[MIDDLE_TIP, 1] < lms[MIDDLE_MCP, 1] and
+                lms[RING_TIP, 1] < lms[RING_MCP, 1]
+            )
+            if fingers_upward:
                 return "[BLOCK_START]", None
 
         # 8. Modificadores de Orientación: [PALM_UP] y [PALM_DOWN]
-        # Evalúa el vector normal de la palma en el eje Y
-        # En coordenadas de imagen: Y apunta hacia abajo
-        normal_y = right_hand.palm_normal[1]
+        # Evalúa el vector normal de la palma en el eje Y cuando la mano tiene al menos 3 dedos extendidos
         if ext_count >= 3:
-            # Palma hacia arriba (Y negativo en coordenadas imagen)
-            if normal_y < -0.48:
+            normal_y = right_hand.palm_normal[1]
+            # Palma hacia arriba (Y negativo)
+            if normal_y < -0.42:
                 return "[PALM_UP]", None
-            # Palma hacia abajo (Y positivo en coordenadas imagen)
-            elif normal_y > 0.48:
+            # Palma hacia abajo (Y positivo)
+            elif normal_y > 0.42:
                 return "[PALM_DOWN]", None
 
         # 9. Delimitadores de Expresión: Mano en 'C' ([C_SHAPE_LEFT] y [C_SHAPE_RIGHT])
-        # Dedos arqueados formando un semicírculo abierto
-        d_c_gap = np.linalg.norm(lms[THUMB_TIP] - lms[INDEX_TIP])
-        if 0.50 * ps < d_c_gap < 1.45 * ps and not (ext_count == 5 or ext_count == 0):
-            # Verificar arco en índice y pulgar
-            v_t_tip = lms[THUMB_TIP] - lms[WRIST]
-            v_i_tip = lms[INDEX_TIP] - lms[WRIST]
-            c_mid_x = (lms[THUMB_TIP, 0] + lms[INDEX_TIP, 0]) / 2.0
-            wrist_x = lms[WRIST, 0]
-            # Abertura orientada a la izquierda o derecha
-            if c_mid_x < wrist_x - 0.05 * ps:
-                return "[C_SHAPE_LEFT]", None
-            elif c_mid_x > wrist_x + 0.05 * ps:
-                return "[C_SHAPE_RIGHT]", None
+        # Curvatura explícita: ni el pulgar ni los demás dedos están completamente estirados
+        # (ext_count == 0 porque los dedos están arqueados formando una media luna/C)
+        if ext_count == 0 and not thumb_ext and not idx_ext:
+            if 0.50 * ps < d_thumb_idx < 1.35 * ps:
+                c_mid_x = (lms[THUMB_TIP, 0] + lms[INDEX_TIP, 0]) / 2.0
+                wrist_x = lms[WRIST, 0]
+                if c_mid_x < wrist_x - 0.06 * ps:
+                    return "[C_SHAPE_LEFT]", None
+                elif c_mid_x > wrist_x + 0.06 * ps:
+                    return "[C_SHAPE_RIGHT]", None
 
-        # 10. Dígitos 1 al 5 en mano dominante
+        # 10. Dígitos 1 al 5 en mano dominante (Reconocimiento Natural y Robusto)
+        # Si ext_count está entre 1 y 5, asignamos directamente el número según la cantidad de dedos extendidos.
         if 1 <= ext_count <= 5:
-            # 1 dedo: Si es pulgar o índice (distinguible de INDEX_EXTENDED si el pulgar está activo o contexto)
-            if ext_count == 1 and thumb_ext and not idx_ext:
+            # Caso 1 dedo: si solo el pulgar está extendido -> [NUM_1]
+            # (si solo el índice estaba extendido ya fue capturado arriba como [INDEX_EXTENDED])
+            if ext_count == 1:
                 return "[NUM_1]", 1
-            elif ext_count == 2 and idx_ext and mid_ext and not ring_ext:
+
+            # Caso 2 dedos: cualquier combinación de 2 dedos (ej. índice+medio, o pulgar+índice no perpendicular)
+            elif ext_count == 2:
                 return "[NUM_2]", 2
-            elif ext_count == 3 and idx_ext and mid_ext and ring_ext and not pinky_ext:
+
+            # Caso 3 dedos: reconoce tanto (índice+medio+anular) como (pulgar+índice+medio)
+            elif ext_count == 3:
                 return "[NUM_3]", 3
-            elif ext_count == 4 and not thumb_ext and idx_ext and mid_ext and ring_ext and pinky_ext:
+
+            # Caso 4 dedos: 4 dedos extendidos cualquiera sea la variación
+            elif ext_count == 4:
                 return "[NUM_4]", 4
+
+            # Caso 5 dedos: los 5 dedos extendidos como valor 5
             elif ext_count == 5:
-                # 5 dedos como número (si no fue capturado como BLOCK_START)
                 return "[NUM_5]", 5
 
         return "[REST_STATE]", None
@@ -560,7 +632,7 @@ class GestureClassifier:
         self.trajectory.append((idx_tip[0], idx_tip[1]))
         self.timestamps.append(now)
 
-        if len(self.trajectory) < 18:
+        if len(self.trajectory) < 14:
             return None
 
         pts = np.array(self.trajectory)
@@ -572,15 +644,15 @@ class GestureClassifier:
         kernel = np.array([0.25, 0.5, 0.25])
         smooth_x = np.convolve(xs, kernel, mode="valid")
         dx = np.diff(smooth_x)
-        # Filtrar ruido menor
-        dx_filtered = np.where(np.abs(dx) > 0.005, dx, 0.0)
+        # Filtrar micro-ruido
+        dx_filtered = np.where(np.abs(dx) > 0.004, dx, 0.0)
         signs = np.sign(dx_filtered)
         nonzero_signs = signs[signs != 0]
 
-        if len(nonzero_signs) >= 4:
+        if len(nonzero_signs) >= 3:
             sign_changes = np.sum(np.diff(nonzero_signs) != 0)
             total_x_span = np.max(xs) - np.min(xs)
-            if sign_changes >= 3 and total_x_span > 0.12:
+            if sign_changes >= 2 and total_x_span > 0.10:
                 self.trajectory.clear()
                 return "[ZIG_ZAG_MOTION]"
 
@@ -590,7 +662,7 @@ class GestureClassifier:
         radii = np.hypot(xs - centroid_x, ys - centroid_y)
         mean_radius = np.mean(radii)
 
-        if mean_radius > 0.04 and (np.max(radii) - np.min(radii)) < 0.12:
+        if mean_radius > 0.035 and (np.max(radii) - np.min(radii)) < 0.14:
             # Calcular ángulo acumulado respecto al centroide
             angles = np.arctan2(ys - centroid_y, xs - centroid_x)
             dtheta = np.diff(angles)
@@ -598,7 +670,7 @@ class GestureClassifier:
             dtheta = (dtheta + np.pi) % (2.0 * np.pi) - np.pi
             cumulative_angle = np.sum(dtheta)
 
-            if abs(cumulative_angle) >= 1.65 * np.pi:  # ~ 300° a 360°
+            if abs(cumulative_angle) >= 1.50 * np.pi:  # ~ 270° a 360°
                 self.trajectory.clear()
                 return "[LOOP_CIRCULAR]"
 
@@ -830,7 +902,7 @@ def main():
     parser.add_argument("--mirror", action="store_true", default=True, help="Activar modo espejo para cámara web (default: True)")
     parser.add_argument("--no-mirror", dest="mirror", action="store_false", help="Desactivar modo espejo")
     parser.add_argument("--headless", action="store_true", default=False, help="Ejecutar sin ventana interactiva OpenCV (útil en servidores/CI)")
-    parser.add_argument("--debounce", type=int, default=6, help="Número de fotogramas mínimos para anti-rebote (default: 6)")
+    parser.add_argument("--debounce", type=int, default=4, help="Número de fotogramas mínimos para anti-rebote (default: 4)")
     args = parser.parse_args()
 
     # Inicializar captura de video
